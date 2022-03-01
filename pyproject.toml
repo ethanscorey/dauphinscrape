@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "Scrape the Dauphin Co. inmate locator"
 authors = ["Ethan Corey <ethanscorey@gmail.com>"]
 license = "MIT"
+packages = [
+    { include = "src" },
+    { include = "src/*.py" },
+]
 
 [tool.poetry.dependencies]
 python = "^3.9"
