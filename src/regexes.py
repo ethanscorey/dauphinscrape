@@ -1,0 +1,8 @@
+ALL_CAPS = r"[A-Z]+"
+ALL_CAPS_PHRASE = r"([A-Z]+ ?)+"
+DATE = r"(\d{2}/\d{2}/\d{4})|(\d{4}-\d{2}-\d{2})"
+DOLLAR_VAL = r"\$?(\d{1,3},?)*\d{1,3}\.\d{2}"
+HEIGHT = r"\d+' \d+\""
+ID_NO = r"(\w|-)+"
+NUM = r"\d+"
+PHRASE = r"(\w+ ?)+"
