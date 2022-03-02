@@ -3,6 +3,7 @@ from dataclasses import asdict
 import datetime
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -35,10 +36,11 @@ def main():
     outfile = f"output{datetime.datetime.now()}.jsonl"
     with requests.Session() as sess:
         init_data = get_initial_data(sess, URL)
-        parse_rows(sess, URL, init_data, outfile)
+        init_count = parse_rows(sess, URL, init_data, outfile)
         time.sleep(0.5)
         for data in get_remainder_data(sess, URL):
-            parse_rows(sess, URL, data, outfile)
+            init_count = parse_rows(sess, URL, data, outfile, init_count)
+            
 
 
 def get_initial_data(sess: requests.Session, url: str) -> list[Tag]:
@@ -58,25 +60,27 @@ def get_initial_data(sess: requests.Session, url: str) -> list[Tag]:
         "releasedB": "checkbox",
     }
     resp = sess.post(url, data=INIT_DATA)
-    logger.debug(resp)
+    logger.debug(f"Initial data resp: {resp}")
     resp.raise_for_status()
     soup = get_soup(resp)
     return soup("tr", attrs={"class": "body"})
 
 
-def get_remainder_data(
-    sess: requests.Session, url: str
-) -> Iterator[list[Tag]]:
+def get_remainder_data(sess: requests.Session, url: str) -> Iterator[list[Tag]]:
     """Yield responses for remaining data until last page reached."""
     assert sess.cookies  # complain if no cookies set
     logger.debug(sess.cookies)
     row_count = 30
     curr_start = 31
     while row_count == 30:
-        resp = sess.post(
-            url, data={"flow_action": "next", "currentStart": curr_start}
-        )
-        logger.debug(resp)
+        try:
+            resp = sess.post(url, data={"flow_action": "next", "currentStart": curr_start})
+        except requests.exceptions.ConnectionError:
+            logger.error("ConnectionError")
+            sess = requests.Session()
+            get_initial_data(sess, url)  # refreshes cookie
+            resp = sess.post(url, data={"flow_action": "next", "currentStart": curr_start})
+        logger.debug(f"Remainder data resp: {resp}")
         resp.raise_for_status()
         soup = get_soup(resp)
         rows = soup("tr", attrs={"class": "body"})
@@ -89,49 +93,60 @@ def get_remainder_data(
 
 def get_person_id(row: Tag) -> list[str]:
     """Extract data needed to get person details."""
-    on_click = row.attrs.get("onclick", "")
-    matches = re.findall(f"[0-9]{NUM}", on_click)
-    logger.debug(matches)
-    if len(matches) == 2:
+    link = row.find("a")
+    if link:
+        matches = re.findall(f"\d{NUM}", link.attrs.get("href"))
+        if len(matches) != 2:
+            logger.error(f"Person ID mismatch: {link}")
+            return []
+        logger.debug(f"Person ID matches: {matches}")
         return matches
     return []
 
 
-def parse_rows(
-    sess: requests.Session, url: str, rows: list[Tag], outfile: str
-) -> None:
+def parse_rows(sess: requests.Session, url: str, rows: list[Tag], outfile: str, count: int = 1) -> None:
     """Parse rows and get person data."""
     for row in rows:
+        logger.debug(f"Row count: {count}")
+        count += 1
         time.sleep(0.5)
         person_id = get_person_id(row)
         if person_id:
+            logger.debug(f"Found person ID {count}")
             sys_id, img_sys_id = person_id
             with open(outfile, "a") as outfile_handle:
+                logger.debug(f"Writing {count}")
                 outfile_handle.write(
-                    json.dumps(
-                        asdict(get_person_data(sess, url, sys_id, img_sys_id))
-                    )
+                    json.dumps(asdict(get_person_data(sess, url, sys_id, img_sys_id, count)))
                     + "\n"
                 )
+        else:
+            logger.debug(f"no person ID found {count}: {row}")
+    return count
 
 
 def get_person_data(
-    sess: requests.Session, url: str, sys_id: str, img_sys_id: str
+        sess: requests.Session, url: str, sys_id: str, img_sys_id: str, count: int
 ) -> PersonData:
     """Get data for individual person in the jail DB."""
-    resp = sess.post(
-        url,
-        data={"flow_action": "edit", "sysID": sys_id, "imgSysID": img_sys_id},
-    )
-    logger.debug(resp)
+    try:
+        resp = sess.post(
+            url, data={"flow_action": "edit", "sysID": sys_id, "imgSysID": img_sys_id}
+        )
+        logger.debug(f"Person response {count}: {resp}")
+    except requests.exceptions.ConnectionError:
+        logger.error("ConnectionError")
+        sess = requests.Session()
+        time.sleep(5)
+        get_initial_data(sess, url)  # refreshes cookie
+        resp = sess.post(url, data={"flow_action": "edit", "sysID": sys_id, "imgSysID": img_sys_id})
     resp.raise_for_status()
     soup = get_soup(resp)
     soup_text = soup.get_text()
     bond_info = cast(
         Tag,
         soup.find(
-            lambda tag: (tag.name == "table")
-            and ("Bond Information" in tag.get_text())
+            lambda tag: (tag.name == "table") and ("Bond Information" in tag.get_text())
         ),
     )
     bond_text = bond_info.get_text() if bond_info is not None else ""
@@ -143,22 +158,13 @@ def get_person_data(
         ),
     )
     person = PersonData(
-        name=get_field(
-            "Name", f"(?P<name>{ALL_CAPS_PHRASE})", soup_text, ["name"]
-        ),
+        name=get_re(f"Name:\s+(?P<name>([A-Z]+ *)+)", soup_text, ["name"]),
         sex=get_field("Sex", f"(?P<sex>{ALL_CAPS})", soup_text, ["sex"]),
         dob=get_field("DOB", f"(?P<dob>{DATE})", soup_text, ["dob"]),
-        height=get_field(
-            "Height", f"(?P<height>{HEIGHT})", soup_text, ["height"]
-        ),
-        weight=get_field(
-            "Weight", f"(?P<weight>{NUM})", soup_text, ["weight"]
-        ),
+        height=get_field("Height", f"(?P<height>{HEIGHT})", soup_text, ["height"]),
+        weight=get_field("Weight", f"(?P<weight>{NUM})", soup_text, ["weight"]),
         hair_color=get_field(
-            "Hair Color",
-            f"(?P<hair_color>{ALL_CAPS})",
-            soup_text,
-            ["hair_color"],
+            "Hair Color", f"(?P<hair_color>{ALL_CAPS})", soup_text, ["hair_color"]
         ),
         hair_length=get_field(
             "Hair Length",
@@ -167,10 +173,7 @@ def get_person_data(
             ["hair_length"],
         ),
         eye_color=get_field(
-            "Eye Color",
-            f"(?P<eye_color>{ALL_CAPS_PHRASE})",
-            soup_text,
-            ["eye_color"],
+            "Eye Color", f"(?P<eye_color>{ALL_CAPS_PHRASE})", soup_text, ["eye_color"]
         ),
         complexion=get_field(
             "Complexion",
@@ -190,14 +193,9 @@ def get_person_data(
             soup_text,
             ["police_county_id"],
         ),
-        race=get_field(
-            "Race", f"(?P<race>{ALL_CAPS_PHRASE})", soup_text, ["race"]
-        ),
+        race=get_field("Race", f"(?P<race>{ALL_CAPS_PHRASE})", soup_text, ["race"]),
         ethnicity=get_field(
-            "Ethnicity",
-            f"(?P<ethnicity>{ALL_CAPS_PHRASE})",
-            soup_text,
-            ["ethnicity"],
+            "Ethnicity", f"(?P<ethnicity>{ALL_CAPS_PHRASE})", soup_text, ["ethnicity"]
         ),
         marital_status=get_field(
             "Marital Status",
@@ -206,16 +204,10 @@ def get_person_data(
             ["marital_status"],
         ),
         citizen=get_field(
-            "Citizen",
-            f"(?P<citizen>{ALL_CAPS_PHRASE})",
-            soup_text,
-            ["citizen"],
+            "Citizen", f"(?P<citizen>{ALL_CAPS_PHRASE})", soup_text, ["citizen"]
         ),
         country_of_birth=get_field(
-            "Country of Birth",
-            f"(?P<cob>{ALL_CAPS_PHRASE})",
-            soup_text,
-            ["cob"],
+            "Country of Birth", f"(?P<cob>{ALL_CAPS_PHRASE})", soup_text, ["cob"]
         ),
         curr_loc=get_field(
             "Current Location",
@@ -227,10 +219,7 @@ def get_person_data(
             "County", f"(?P<county>{ALL_CAPS_PHRASE})", soup_text, ["county"]
         ),
         commit_date=get_field(
-            "Commitment Date",
-            f"(?P<commit_date>{DATE})",
-            soup_text,
-            ["commit_date"],
+            "Commitment Date", f"(?P<commit_date>{DATE})", soup_text, ["commit_date"]
         ),
         proj_release_date=get_field(
             "Projected Release Date",
@@ -239,14 +228,9 @@ def get_person_data(
             ["proj_release_date"],
         ),
         bond_type=get_field(
-            "Bond Type",
-            f"(?P<bond_type>{ALL_CAPS_PHRASE})",
-            bond_text,
-            ["bond_type"],
+            "Bond Type", f"(?P<bond_type>{ALL_CAPS_PHRASE})", bond_text, ["bond_type"],
         ),
-        bond_status=get_field(
-            "Status", f"(?P<status>{PHRASE})", bond_text, ["status"]
-        ),
+        bond_status=get_field("Status", f"(?P<status>{PHRASE})", bond_text, ["status"]),
         posted_by=get_field(
             "Posted By", f"(?P<posted_by>{PHRASE})", bond_text, ["posted_by"]
         ),
@@ -254,10 +238,7 @@ def get_person_data(
             "Post Date", f"(?P<post_date>{DATE})", bond_text, ["post_date"]
         ),
         bond_total=get_field(
-            "Grand Total",
-            f"(?P<bond_total>{DOLLAR_VAL})",
-            bond_text,
-            ["bond_total"],
+            "Grand Total", f"(?P<bond_total>{DOLLAR_VAL})", bond_text, ["bond_total"],
         ),
         charges=get_charges(charge_info),
     )
@@ -269,9 +250,7 @@ def get_charges(soup: Tag) -> list[ChargeData]:
     """Extract charge data from Charge Information table."""
     if soup is None:
         return []
-    charge_rows = soup(
-        lambda tag: (tag.name == "tr") and not tag.attrs.get("class")
-    )
+    charge_rows = soup(lambda tag: (tag.name == "tr") and not tag.attrs.get("class"))
     out = []
     for row in charge_rows:
         logger.debug(row)
@@ -308,9 +287,7 @@ def get_field(
     return get_re(f"{field_name}:\n{pattern}", text, groups).strip()
 
 
-def get_soup(
-    resp: requests.Response, parser: str = "html.parser"
-) -> BeautifulSoup:
+def get_soup(resp: requests.Response, parser: str = "html.parser") -> BeautifulSoup:
     return BeautifulSoup(resp.content, parser)
 
 
