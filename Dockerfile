@@ -12,4 +12,4 @@ RUN apt-get update \
 && useradd -m scrapy
 COPY . /usr/src/app/
 USER scrapy
-CMD ["scrapy" "crawl" "jail"]
+CMD ["poetry", "run", "scrapy", "crawl", "jail"]
